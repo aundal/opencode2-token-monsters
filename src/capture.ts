@@ -410,8 +410,20 @@ export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
         const current: MsgEntry[] = []
         let order = 0
         for (const m of messages) {
-          const id = m?.info?.id || `idx${order}`
-          const e = entryFor(m?.info, m?.parts || [])
+          // V2 context-hook messages are flat ({ id, role, content: [...] }),
+          // V1 uses { info, parts }. Normalize to entryFor's shape.
+          const info = m?.info ?? { role: m?.role, time: m?.time, id: m?.id, tokens: m?.tokens }
+          const rawParts = Array.isArray(m?.parts) ? m.parts : Array.isArray(m?.content) ? m.content : []
+          const parts = rawParts.map((p: any) => {
+            if (!p || typeof p !== "object" || p.type === "text" || p.type === "file") return p
+            const toolName = p.tool || p.name
+            if (p.type === "tool" || (toolName && (p.state || p.input !== undefined || p.output !== undefined))) {
+              return { type: "tool", id: p.id, tool: toolName, state: p.state || { input: p.input ?? p.args, output: p.output ?? p.result } }
+            }
+            return p
+          })
+          const id = m?.info?.id || m?.id || `idx${order}`
+          const e = entryFor(info, parts)
           if (!e.o) e.o = order
           current.push(e)
           s.unique.set(id, e)
