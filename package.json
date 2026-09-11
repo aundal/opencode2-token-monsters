@@ -1,5 +1,5 @@
 {
-  "name": "@aundal/opencode-token-monsters",
+  "name": "@aundal/opencode-token-monsters-opencode2",
   "version": "0.1.6",
   "description": "OpenCode plugin that shows Token Monsters token usage breakdowns in the TUI sidebar.",
   "author": "aundal",

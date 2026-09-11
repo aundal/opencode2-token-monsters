@@ -364,3 +364,62 @@ export const TokenUsageCapture: Plugin = async ({ directory, worktree }) => {
 }
 
 export default TokenUsageCapture
+
+// V2 setup: same cache via the session context hook ({ system, messages, tools }).
+// V1 calls server() and uses the returned transform hooks.
+export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
+  const directory = ctx?.location?.directory || ctx?.directory || process.cwd()
+  try {
+    await ctx?.session?.hook?.("context", (event: any) => {
+      try {
+        const sessionID = event?.sessionID
+        if (!sessionID) return
+        const s = session(sessionID)
+        const system = Array.isArray(event?.system) ? event.system : []
+        if (system.length) {
+          const texts = system.map((p: any) => (typeof p === "string" ? p : p?.text || "")).filter(Boolean)
+          if (texts.length) s.lastSystem = classifySystem(texts.join("\n"), instructionTexts(directory))
+        }
+        const tools = event?.tools
+        if (tools && typeof tools === "object") {
+          try {
+            if (buf.done) buf = { sum: 0, ids: new Set(), byTool: {} }
+            for (const [id, def] of Object.entries(tools as Record<string, any>)) {
+              if (buf.ids.has(id)) continue
+              const size = tok((def as any)?.description || "") + tok(JSON.stringify((def as any)?.input ?? (def as any)?.parameters ?? {}))
+              buf.ids.add(id)
+              buf.sum += size
+              buf.byTool[id] = size
+            }
+          } catch {}
+        }
+        const messages = Array.isArray(event?.messages) ? event.messages : []
+        if (!messages.length) return
+        const sys = s.lastSystem || { opencode: 0, agents: 0, skillDefs: 0 }
+        const overhead: Overhead = {
+          opencode: sys.opencode,
+          agents: sys.agents,
+          skillDefs: sys.skillDefs,
+          toolDefs: buf.sum,
+          toolDefsByTool: { ...buf.byTool },
+        }
+        s.overheadCurrent = overhead
+        addOverhead(s.overheadTotal, overhead)
+        s.reqCount += 1
+        buf.done = true
+        const current: MsgEntry[] = []
+        let order = 0
+        for (const m of messages) {
+          const id = m?.info?.id || `idx${order}`
+          const e = entryFor(m?.info, m?.parts || [])
+          if (!e.o) e.o = order
+          current.push(e)
+          s.unique.set(id, e)
+          order++
+        }
+        s.current = current
+        scheduleWrite()
+      } catch {}
+    })
+  } catch {}
+}
