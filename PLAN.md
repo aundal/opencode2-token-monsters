@@ -7,13 +7,11 @@
 - Purpose: OpenCode plugin showing token usage in the TUI sidebar.
 
 ## Current Work
-- Restart OpenCode and verify Overhead appears when server/TUI plugins are loaded from `../../opencode-token-monsters/src/*`.
-- Verify `Actual` roughly matches OpenCode `Context now` after a new request with the fixed current-request scope.
-- Verify `Context` displays OpenCode's total including reasoning tokens and inline cache hit percentage using dot thousands separators.
-- Verify `tool defs` expands to each tool in `Actual` and after new captures in `Total`.
-- Verify `skill defs` expands to every skill listed in `<available_skills>` after a new capture.
-- Verify `Skills` expands to each skill call after a new skill tool use.
-- `AGENTS.md` fix verified in source: `classifySystem` returns agents=532/486 against the real system prompt. Not visible in TUI because the running OpenCode instance (PID 34956, started 14:35) predates the fix and still writes the legacy module-dir cache with agents=0. Restart OpenCode and verify AGENTS.md row appears for the current session.
+- Restart OpenCode and verify Aktuel (siden sidste compact) window matches footer after calibration; Total (hel session) >= Aktuel.
+- Verify `AGENTS.md` expands per file (`agentsByFile`, e.g. `global:AGENTS.md`) after new captures.
+- Verify `tool defs` expands per tool in both scopes.
+- Verify Context line is gone from sidebar.
+- Verify legacy inflated `overheadTotal` no longer affects display (TUI uses snapshot).
 
 ## Future Tasks
 - Publish a package update after the Overhead cache-path fix is verified.

@@ -5,13 +5,14 @@
 //
 // Reads the per-request breakdown written by token-usage-capture.ts. Two
 // selectors:
-//   Session:  Actual  (active session, survives compaction)
-//             Total   (all cached sessions)
+//   Session:  Aktuel  (siden sidste compact)
+//             Total   (hel session inkl. pre-compact, aldrig nulstillet)
 //   View:     Prompts (per message: Input / Output / Tool calls / Files)
 //             Tools   (aggregated: Input, Output, Tools by type)
 //
-// Overhead (opencode prompt, AGENTS.md, tool defs, skill defs, Skills) is shown
-// in both scopes. Counts are o200k: exact for OpenAI models, ~approx otherwise.
+// Overhead (opencode prompt, AGENTS.md pr. fil, tool defs pr. tool,
+// skill defs, Skills) is shown in both scopes. Breakdown ratios are o200k,
+// calibrated so the current window matches OpenCode's real token counts.
 
 import { createMemo, createSignal, onCleanup, onMount, For, Show } from "solid-js"
 import { homedir } from "node:os"
@@ -154,28 +155,74 @@ function skillLabel(input) {
   return String(raw).split(/[\\/]/).pop() || "skill"
 }
 
+function msgRole(m) {
+  return m?.role ?? m?.type ?? m?.info?.role ?? "assistant"
+}
+
+function msgTokens(m) {
+  return m?.tokens ?? m?.info?.tokens ?? null
+}
+
+function msgTime(m) {
+  return m?.time?.created ?? m?.info?.time?.created ?? m?.time?.completed ?? 0
+}
+
+function msgParts(api, m) {
+  if (Array.isArray(m?.content)) return m.content
+  if (Array.isArray(m?.parts)) return m.parts
+  try {
+    const id = m?.id ?? m?.info?.id
+    if (id && typeof api.state?.part === "function") return api.state.part(id) || []
+  } catch {}
+  return []
+}
+
+// V2 data-layer first (state.session.message.list), V1 state API as fallback.
+// V2 messages carry role in `type` and content inline; V1 uses info/parts.
+function listLiveMessages(api, sessionID) {
+  if (!sessionID) return []
+  try {
+    const msgApi = api.state?.session?.message
+    if (msgApi && typeof msgApi.list === "function") {
+      const list = msgApi.list(sessionID) ?? []
+      if (Array.isArray(list) && list.length) return list
+    }
+  } catch {}
+  try {
+    const list = api.state?.session?.messages?.(sessionID) ?? []
+    if (Array.isArray(list) && list.length) return list
+  } catch {}
+  return []
+}
+
+function partText(v) {
+  if (typeof v === "string") return v
+  if (v == null) return ""
+  try { return JSON.stringify(v) } catch { return String(v) }
+}
+
 function fallbackEntry(message, parts) {
-  const role = message?.role === "user" ? "u" : "a"
-  const e = { r: role, in: 0, out: 0, t: {}, tc: {}, tt: {}, f: 0, fl: {}, s: 0, sl: {}, o: message?.time?.created || 0 }
+  const role = msgRole(message) === "user" ? "u" : "a"
+  const e = { r: role, in: 0, out: 0, t: {}, tc: {}, tt: {}, f: 0, fl: {}, s: 0, sl: {}, o: msgTime(message) }
   for (const p of parts || []) {
-    if (p?.type === "text" && !p.synthetic && typeof p.text === "string") {
+    if ((p?.type === "text" || p?.type === "reasoning") && !p.synthetic && typeof p.text === "string") {
       const n = tokGuess(p.text)
       if (role === "u") e.in += n
       else e.out += n
     } else if (p?.type === "tool") {
-      const name = p.tool || "tool"
-      const out = typeof p.state?.output === "string" ? p.state.output : ""
-      const args = p.state?.input ? JSON.stringify(p.state.input) : ""
+      const name = p.tool || p.name || "tool"
+      const out = partText(p.state?.output ?? p.output ?? p.result)
+      const args = p.state?.input ? JSON.stringify(p.state.input) : partText(p.input ?? p.args)
       const n = tokGuess(out) + tokGuess(args)
       if (name === "skill") {
         e.s += n
-        const label = skillLabel(p.state?.input)
+        const label = skillLabel(p.state?.input ?? p.input)
         e.sl[label] = (e.sl[label] || 0) + n
       }
       else {
         e.t[name] = (e.t[name] || 0) + n
         e.tc[name] = (e.tc[name] || 0) + 1
-        const targets = toolTargets(name, p.state?.input, out, n)
+        const targets = toolTargets(name, p.state?.input ?? p.input, out, n)
         if (Object.keys(targets).length) e.tt[name] = targets
       }
       for (const a of p.state?.attachments || []) {
@@ -204,8 +251,8 @@ function fallbackEntry(message, parts) {
 
 function buildFallback(api, sessionID) {
   try {
-    const messages = api.state.session.messages(sessionID) || []
-    const entries = messages.map((m) => fallbackEntry(m, api.state.part(m.id) || []))
+    const messages = listLiveMessages(api, sessionID)
+    const entries = messages.map((m) => fallbackEntry(m, msgParts(api, m)))
     return { current: entries.length ? [entries[entries.length - 1]] : [], total: entries, overheadCurrent: {}, overheadTotal: {} }
   } catch {
     return { current: [], total: [], overheadCurrent: {}, overheadTotal: {} }
@@ -214,6 +261,63 @@ function buildFallback(api, sessionID) {
 
 function entryTotal(e) {
   return (e?.in || 0) + (e?.out || 0) + sumVals(e?.t) + (e?.f || 0) + (e?.s || 0)
+}
+
+function realLastWindow(api, sessionID) {
+  try {
+    const messages = listLiveMessages(api, sessionID)
+    let last = null
+    for (const m of messages) {
+      const t = msgTokens(m)
+      if (t && ((t.output || 0) > 0 || (t.input || 0) > 0 || (t.cache?.read || 0) > 0)) last = t
+    }
+    if (!last) return 0
+    return (last.input || 0) + (last.output || 0) + (last.reasoning || 0) + (last.cache?.read || 0) + (last.cache?.write || 0)
+  } catch {
+    return 0
+  }
+}
+
+function approxEntriesTotal(entries) {
+  let n = 0
+  for (const e of entries || []) n += (e?.in || 0) + (e?.out || 0) + sumVals(e?.t) + (e?.f || 0) + (e?.s || 0)
+  return n
+}
+
+function approxOverheadTotal(ov) {
+  return (ov?.opencode || 0) + (ov?.agents || 0) + (ov?.skillDefs || 0) + (ov?.toolDefs || 0)
+}
+
+function scaleEntries(entries, f) {
+  if (!f || f === 1) return entries
+  return (entries || []).map((e) => ({
+    ...e,
+    in: Math.round((e.in || 0) * f),
+    out: Math.round((e.out || 0) * f),
+    t: Object.fromEntries(Object.entries(e.t || {}).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)])),
+    tc: { ...(e.tc || {}) },
+    tt: e.tt || {},
+    f: Math.round((e.f || 0) * f),
+    fl: Object.fromEntries(Object.entries(e.fl || {}).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)])),
+    s: Math.round((e.s || 0) * f),
+    sl: e.sl ? Object.fromEntries(Object.entries(e.sl).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)])) : e.sl,
+  }))
+}
+
+function scaleOverhead(ov, f) {
+  if (!ov) return ov
+  if (!f || f === 1) return ov
+  const out = {
+    ...ov,
+    opencode: Math.round((ov.opencode || 0) * f),
+    agents: Math.round((ov.agents || 0) * f),
+    skillDefs: Math.round((ov.skillDefs || 0) * f),
+    toolDefs: Math.round((ov.toolDefs || 0) * f),
+  }
+  if (ov.toolDefsByTool) out.toolDefsByTool = Object.fromEntries(Object.entries(ov.toolDefsByTool).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)]))
+  if (ov.agentsByFile) out.agentsByFile = Object.fromEntries(Object.entries(ov.agentsByFile).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)]))
+  if (ov.skillDefsBySkill) out.skillDefsBySkill = Object.fromEntries(Object.entries(ov.skillDefsBySkill).map(([k, v]) => [k, Math.round((Number(v) || 0) * f)]))
+  return out
 }
 
 function mergeLiveEntries(captured, live) {
@@ -241,7 +345,7 @@ function toolChildren(toolsObj, countsObj, targetsObj) {
     .filter((t) => t.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens)
   const withLabel = (name, count) => (countsObj && count > 0 ? `${name} (${count})` : name)
-  const targetChildren = (targets) => Object.entries(targets || {}).sort((a, b) => b[1] - a[1]).map(([full, count]) => ({ label: clip(full, LABEL_W), fullLabel: full, tokens: 0, count: Number(count) || 0 }))
+  const targetChildren = (targets) => Object.entries(targets || {}).sort((a, b) => b[1] - a[1]).map(([full, tokens]) => ({ label: clip(full, LABEL_W), fullLabel: full, tokens: Number(tokens) || 0 }))
   const head = arr.slice(0, TOOL_ROWS).map((t) => ({
     label: withLabel(t.name, t.count),
     tokens: t.tokens,
@@ -266,7 +370,11 @@ function filesNode(flObj, total) {
 function overheadNode(ov, scope, skillsTotal, skillsObj) {
   const kids = []
   if ((ov.opencode || 0) > 0) kids.push({ label: "opencode", tokens: ov.opencode })
-  if ((ov.agents || 0) > 0) kids.push({ label: "AGENTS.md", tokens: ov.agents })
+  if ((ov.agents || 0) > 0) {
+    const node = { label: "AGENTS.md", tokens: ov.agents }
+    if (ov.agentsByFile) node.children = toolChildren(ov.agentsByFile)
+    kids.push(node)
+  }
   if ((ov.toolDefs || 0) > 0) {
     const node = { label: "tool defs", tokens: ov.toolDefs }
     if (ov.toolDefsByTool) node.children = toolChildren(ov.toolDefsByTool)
@@ -498,16 +606,17 @@ function View(props) {
   const head = createMemo(() => {
     try {
       const id = props.session_id
-      let last
-      if (id) {
-        const messages = api.state.session.messages(id) || []
-        for (const m of messages) if (m.role === "assistant" && (m.tokens?.output || 0) > 0) last = m
+      const messages = listLiveMessages(api, id)
+      let last = null
+      for (const m of messages) {
+        const t = msgTokens(m)
+        if (t && ((t.output || 0) > 0 || (t.input || 0) > 0)) last = t
       }
-      const ctx = last ? (last.tokens.input || 0) + (last.tokens.output || 0) + (last.tokens.reasoning || 0) + (last.tokens.cache?.read || 0) + (last.tokens.cache?.write || 0) : 0
+      const ctx = last ? (last.input || 0) + (last.output || 0) + (last.reasoning || 0) + (last.cache?.read || 0) + (last.cache?.write || 0) : 0
       return {
         has: !!last,
         contextNow: ctx,
-        cachedPct: ctx > 0 && last ? Math.round(((last.tokens.cache?.read || 0) / ctx) * 100) : 0,
+        cachedPct: ctx > 0 && last ? Math.round(((last.cache?.read || 0) / ctx) * 100) : 0,
       }
     } catch {
       return { has: false, contextNow: 0, cachedPct: 0 }
@@ -519,18 +628,31 @@ function View(props) {
     const raw = capture()
     const cap = raw?.session || live
     const sc = scope()
+    // Calibration: scale approx breakdown so the current window matches
+    // OpenCode's real token counts (input+output+reasoning+cache).
+    const sinceBase = cap.sinceCompact || cap.current || []
+    const approxNow = approxOverheadTotal(cap.overheadCurrent || {}) + approxEntriesTotal(mergeLiveEntries(sinceBase, live.total || []))
+    const realNow = realLastWindow(api, props.session_id)
+    const factor = approxNow > 0 && realNow > 0 ? realNow / approxNow : 1
     if (sc === "total") {
-      const all = raw?.all || { total: cap.total || [], overheadTotal: cap.overheadTotal || {} }
-      const entries = mergeLiveEntries(all.total || [], live.total || [])
-      return { ready: true, list: buildList(entries, all.overheadTotal || {}, "total", view()) }
+      // Total = hel session inkl. pre-compact (aldrig nulstillet).
+      // Overhead er altid sidste snapshot (overheadLast/Current) — aldrig den
+      // legacy summerede overheadTotal fra før snapshot-fixet.
+      const base = cap.total || []
+      const entries = scaleEntries(mergeLiveEntries(base, live.total || []), factor)
+      const ov = scaleOverhead(cap.overheadLast || cap.overheadCurrent || {}, factor)
+      return { ready: true, list: buildList(entries, ov, "total", view()) }
     }
-    if (!cap || !Array.isArray(cap.current)) return { ready: false, list: [] }
-    const entries = mergeLiveEntries(cap.current || [], live.current || [])
-    return { ready: true, list: buildList(entries, cap.overheadCurrent || {}, "actual", view()) }
+    // Aktuel = siden sidste compact.
+    const base = cap.sinceCompact || cap.current || []
+    if (!Array.isArray(base)) return { ready: false, list: [] }
+    const entries = scaleEntries(mergeLiveEntries(base, live.total || []), factor)
+    const ov = scaleOverhead(cap.overheadCurrent || {}, factor)
+    return { ready: true, list: buildList(entries, ov, "actual", view()) }
   })
 
   const colors = () => palette(api)
-  const scopeLabel = () => (scope() === "total" ? "Total" : "Actual")
+  const scopeLabel = () => (scope() === "total" ? "Total" : "Aktuel")
   const viewLabel = () => (view() === "prompt" ? "Prompts" : "Tools")
 
   return (
@@ -553,8 +675,7 @@ function View(props) {
               <Selector colors={colors()} label="View" value={viewLabel()} onToggle={toggleView} />
             </box>
 
-            <box flexDirection="column" gap={0} paddingTop={1}>
-              <Line colors={colors()} label="Context" value={`${fmt(head().contextNow)} (${head().cachedPct}% cache hit)`} strong />
+            <box flexDirection="column" gap={0}>
               <Show when={detail()}>
                 <box flexDirection="column" gap={0} paddingTop={1}>
                   <text fg={colors().muted}>Selected path</text>
@@ -564,7 +685,7 @@ function View(props) {
             </box>
 
             <box flexDirection="column" gap={0} paddingTop={1}>
-              <text fg={colors().muted}>{scope() === "total" ? "All sessions ~approx" : "Actual session ~approx"}</text>
+              <text fg={colors().muted}>{scope() === "total" ? "Hel session ~approx" : "Siden sidste compact ~approx"}</text>
               <Show when={model().ready} fallback={<text fg={colors().muted}>No session data</text>}>
                 <For each={model().list}>
                   {(item) => <TreeRow node={item} depth={0} path={item.label} colors={colors()} expanded={expanded} toggle={toggle} toggleDetail={toggleDetail} />}
@@ -742,10 +863,11 @@ function resolveSessionID(api, slotProps) {
   if (typeof direct === "string" && direct) return direct
   try {
     const route = api?.route?.current
-    if (route?.name !== "session") return undefined
-    const fromParams = route?.params?.sessionID
+    const kind = route?.type ?? route?.name
+    if (kind !== "session") return undefined
+    const fromParams = route?.params?.sessionID ?? route?.params?.session_id
     if (typeof fromParams === "string" && fromParams) return fromParams
-    const fromData = route?.data?.sessionID
+    const fromData = route?.data?.sessionID ?? route?.data?.session_id ?? route?.sessionID ?? route?.session_id
     if (typeof fromData === "string" && fromData) return fromData
   } catch {}
   return undefined

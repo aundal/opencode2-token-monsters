@@ -16,9 +16,10 @@ import { dirname, join } from "node:path"
 //   experimental.chat.messages.transform  -> the ACTUAL sent messages
 //
 // Per session it keeps:
-//   current  - the last request only (= "Aktuel Session")
-//   total    - union of every unique message ever sent + overhead summed per
-//              request (= "Total Session", survives compaction)
+//   sinceCompact / current - last dispatch snapshot (= "Aktuel", siden sidste compact)
+//   total    - union of every unique message ever sent (= "Total", hel session,
+//              never cleared, survives compaction via compaction hook + cache)
+//   overhead - snapshot per dispatch (overwrites, never summed per step)
 //
 // Tokens are o200k (gpt-tokenizer). Exact for OpenAI models, ~approx for others.
 // ---------------------------------------------------------------------------
@@ -50,14 +51,15 @@ function tokPart(key: string, text: string): number {
 
 // One message's token breakdown. r: "u" user / "a" assistant.
 type MsgEntry = { r: "u" | "a"; in: number; out: number; t: Record<string, number>; tc: Record<string, number>; tt: Record<string, Record<string, number>>; f: number; fl: Record<string, number>; s: number; o: number }
-type Overhead = { opencode: number; agents: number; skillDefs: number; toolDefs: number; toolDefsByTool?: Record<string, number> }
+type Overhead = { opencode: number; agents: number; skillDefs: number; toolDefs: number; toolDefsByTool?: Record<string, number>; agentsByFile?: Record<string, number> }
 type SessionState = {
   reqCount: number
   overheadCurrent: Overhead
   overheadTotal: Overhead
   current: MsgEntry[]
-  unique: Map<string, MsgEntry> // by message id, for the "total" view
-  lastSystem?: { opencode: number; agents: number; skillDefs: number }
+  sinceCompact: MsgEntry[]
+  unique: Map<string, MsgEntry> // by message id, for the "total" view (never cleared, survives compaction)
+  lastSystem?: { opencode: number; agents: number; skillDefs: number; agentsByFile?: Record<string, number> }
 }
 
 const toolSizes: Record<string, number> = {} // global per-tool definition sizes
@@ -95,11 +97,13 @@ function session(id: string): SessionState {
       unique.set(`cached:${entry.o}:${entry.r}:${idx}`, entry)
     }
 
+    const overheadLast: Overhead = cached?.overheadLast || cached?.overheadCurrent || { opencode: 0, agents: 0, skillDefs: 0, toolDefs: 0 }
     s = {
       reqCount: cached?.reqCount || 0,
-      overheadCurrent: cached?.overheadCurrent || { opencode: 0, agents: 0, skillDefs: 0, toolDefs: 0 },
-      overheadTotal: cached?.overheadTotal || { opencode: 0, agents: 0, skillDefs: 0, toolDefs: 0 },
-      current: cached?.current || [],
+      overheadCurrent: overheadLast,
+      overheadTotal: overheadLast,
+      current: cached?.sinceCompact || cached?.current || [],
+      sinceCompact: cached?.sinceCompact || cached?.current || [],
       unique,
     }
     sessions.set(id, s)
@@ -132,7 +136,9 @@ function scheduleWrite() {
           reqCount: s.reqCount,
           overheadCurrent: s.overheadCurrent,
           overheadTotal: s.overheadTotal,
+          overheadLast: s.overheadCurrent,
           current: s.current,
+          sinceCompact: s.sinceCompact,
           total,
         }
       }
@@ -141,22 +147,35 @@ function scheduleWrite() {
   }, WRITE_DEBOUNCE_MS)
 }
 
-function instructionTexts(directory?: string, worktree?: string): string[] {
-  const out: string[] = []
+function instructionEntries(directory?: string, worktree?: string): { label: string; text: string }[] {
+  const out: { label: string; text: string }[] = []
   const seen = new Set<string>()
-  for (const base of [CONFIG_DIR, worktree, directory]) {
+  const bases: { label: string; base?: string }[] = [
+    { label: "global", base: join(homedir(), ".config", "opencode") },
+    { label: "plugin", base: CONFIG_DIR },
+    { label: "worktree", base: worktree },
+    { label: "project", base: directory },
+  ]
+  for (const { label, base } of bases) {
     if (!base || base === "/") continue
     const file = join(base, "AGENTS.md")
     if (seen.has(file)) continue
     seen.add(file)
     try {
-      if (existsSync(file)) out.push(readFileSync(file, "utf8").trim())
+      if (existsSync(file)) {
+        const text = readFileSync(file, "utf8").trim()
+        if (text) out.push({ label: `${label}:AGENTS.md`, text })
+      }
     } catch {}
   }
   return out
 }
 
-function classifySystem(system: string, instructions: string[]) {
+function instructionTexts(directory?: string, worktree?: string): string[] {
+  return instructionEntries(directory, worktree).map((e) => e.text)
+}
+
+function classifySystem(system: string, instructions: string[] | { label: string; text: string }[]) {
   const total = tok(system)
   let skillDefs = 0
   const skillEnd = system.indexOf("</available_skills>")
@@ -173,12 +192,19 @@ function classifySystem(system: string, instructions: string[]) {
     environment = tok(system.slice(envIdx, envEnd > 0 ? envEnd + 6 : Math.min(system.length, envIdx + 800)))
   }
   let agents = 0
-  for (const text of instructions) {
+  const agentsByFile: Record<string, number> = {}
+  for (const item of instructions) {
+    const text = typeof item === "string" ? item : item.text
+    const label = typeof item === "string" ? "AGENTS.md" : item.label
     const probe = text.slice(0, 80)
-    if (probe && system.includes(probe)) agents += tok(text)
+    if (probe && system.includes(probe)) {
+      const n = tok(text)
+      agents += n
+      agentsByFile[label] = (agentsByFile[label] || 0) + n
+    }
   }
   const opencode = Math.max(0, total - skillDefs - environment - agents) + environment
-  return { opencode, agents, skillDefs }
+  return { opencode, agents, skillDefs, agentsByFile }
 }
 
 // Short, displayable name for a loaded file part.
@@ -254,17 +280,22 @@ function toolTargets(name: string, input: any, output: string, totalTokens: numb
 
 // Build a per-message entry from one {info, parts}.
 function entryFor(info: any, parts: any[]): MsgEntry {
-  const role: "u" | "a" = info?.role === "user" ? "u" : "a"
+  const role: "u" | "a" = (info?.role ?? info?.type) === "user" ? "u" : "a"
   const e: MsgEntry = { r: role, in: 0, out: 0, t: {}, tc: {}, tt: {}, f: 0, fl: {}, s: 0, o: info?.time?.created || 0 }
+  const strVal = (v: any): string => {
+    if (typeof v === "string") return v
+    if (v == null) return ""
+    try { return JSON.stringify(v) } catch { return String(v) }
+  }
   for (const p of parts || []) {
-    if (p?.type === "text" && !p.synthetic && typeof p.text === "string") {
+    if ((p?.type === "text" || p?.type === "reasoning") && !p.synthetic && typeof p.text === "string") {
       const n = tokPart(p.id || "t", p.text)
       if (role === "u") e.in += n
       else e.out += n
     } else if (p?.type === "tool") {
-      const name = p.tool || "tool"
-      const out = typeof p.state?.output === "string" ? p.state.output : ""
-      const args = p.state?.input ? JSON.stringify(p.state.input) : ""
+      const name = p.tool || p.name || "tool"
+      const out = strVal(p.state?.output ?? p.output ?? p.result)
+      const args = p.state?.input ? JSON.stringify(p.state.input) : strVal(p.input ?? p.args)
       const n = tokPart(`${p.id}:o`, out) + tokPart(`${p.id}:a`, args)
       if (name === "skill") e.s += n
       else {
@@ -318,7 +349,7 @@ export const TokenUsageCapture: Plugin = async ({ directory, worktree }) => {
       try {
         const sessionID = input.sessionID
         if (!sessionID || !Array.isArray(output.system)) return
-        session(sessionID).lastSystem = classifySystem(output.system.join("\n"), instructionTexts(directory, worktree))
+        session(sessionID).lastSystem = classifySystem(output.system.join("\n"), instructionEntries(directory, worktree))
       } catch {}
     },
 
@@ -331,21 +362,23 @@ export const TokenUsageCapture: Plugin = async ({ directory, worktree }) => {
         if (!sessionID) return
         const s = session(sessionID)
 
-        // Overhead for this request.
+        // Overhead for this request (snapshot, overwrites — never summed per step).
         const sys = s.lastSystem || { opencode: 0, agents: 0, skillDefs: 0 }
         const overhead: Overhead = {
           opencode: sys.opencode,
           agents: sys.agents,
+          agentsByFile: (sys as any).agentsByFile || {},
           skillDefs: sys.skillDefs,
           toolDefs: buf.sum,
           toolDefsByTool: { ...buf.byTool },
         }
         s.overheadCurrent = overhead
-        addOverhead(s.overheadTotal, overhead)
+        s.overheadTotal = { ...overhead }
         s.reqCount += 1
         buf.done = true // next tool.definition starts a fresh request buffer
 
-        // Messages for this request (current) + union into total (unique by id).
+        // Messages for this request (Aktuel = siden sidste compact) + union into
+        // total (Total = hel session, never cleared, survives compaction).
         const current: MsgEntry[] = []
         let order = 0
         for (const m of messages) {
@@ -357,6 +390,7 @@ export const TokenUsageCapture: Plugin = async ({ directory, worktree }) => {
           order++
         }
         s.current = current
+        s.sinceCompact = current
         scheduleWrite()
       } catch {}
     },
@@ -370,6 +404,21 @@ export default TokenUsageCapture
 export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
   const directory = ctx?.location?.directory || ctx?.directory || process.cwd()
   try {
+    await ctx?.session?.hook?.("compaction", (event: any) => {
+      try {
+        const sessionID = event?.sessionID
+        if (!sessionID) return
+        // Fold pre-compact history into the never-cleared total union, then
+        // reset the since-compact window. Next context hook overwrites it.
+        const s = session(sessionID)
+        for (const e of s.sinceCompact || []) {
+          s.unique.set(`precompact:${e.o}:${e.r}:${s.unique.size}`, { ...e })
+        }
+        s.sinceCompact = []
+        s.current = []
+        scheduleWrite()
+      } catch {}
+    })
     await ctx?.session?.hook?.("context", (event: any) => {
       try {
         const sessionID = event?.sessionID
@@ -378,19 +427,22 @@ export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
         const system = Array.isArray(event?.system) ? event.system : []
         if (system.length) {
           const texts = system.map((p: any) => (typeof p === "string" ? p : p?.text || "")).filter(Boolean)
-          if (texts.length) s.lastSystem = classifySystem(texts.join("\n"), instructionTexts(directory))
+          if (texts.length) s.lastSystem = classifySystem(texts.join("\n"), instructionEntries(directory))
         }
+        // Full tool snapshot per dispatch (never accumulated across steps).
+        let toolSum = 0
+        let toolByTool: Record<string, number> = {}
         const tools = event?.tools
         if (tools && typeof tools === "object") {
           try {
-            if (buf.done) buf = { sum: 0, ids: new Set(), byTool: {} }
             for (const [id, def] of Object.entries(tools as Record<string, any>)) {
-              if (buf.ids.has(id)) continue
               const size = tok((def as any)?.description || "") + tok(JSON.stringify((def as any)?.input ?? (def as any)?.parameters ?? {}))
-              buf.ids.add(id)
-              buf.sum += size
-              buf.byTool[id] = size
+              toolSum += size
+              toolByTool[id] = size
             }
+            buf.sum = toolSum
+            buf.byTool = { ...toolByTool }
+            buf.ids = new Set(Object.keys(toolByTool))
           } catch {}
         }
         const messages = Array.isArray(event?.messages) ? event.messages : []
@@ -399,12 +451,13 @@ export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
         const overhead: Overhead = {
           opencode: sys.opencode,
           agents: sys.agents,
+          agentsByFile: (sys as any).agentsByFile || {},
           skillDefs: sys.skillDefs,
-          toolDefs: buf.sum,
-          toolDefsByTool: { ...buf.byTool },
+          toolDefs: toolSum,
+          toolDefsByTool: { ...toolByTool },
         }
         s.overheadCurrent = overhead
-        addOverhead(s.overheadTotal, overhead)
+        s.overheadTotal = { ...overhead }
         s.reqCount += 1
         buf.done = true
         const current: MsgEntry[] = []
@@ -412,7 +465,8 @@ export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
         for (const m of messages) {
           // V2 context-hook messages are flat ({ id, role, content: [...] }),
           // V1 uses { info, parts }. Normalize to entryFor's shape.
-          const info = m?.info ?? { role: m?.role, time: m?.time, id: m?.id, tokens: m?.tokens }
+          // V2 role lives in `type` (assistant/user); tokens are top-level.
+          const info = m?.info ?? { role: m?.role ?? m?.type, time: m?.time, id: m?.id, tokens: m?.tokens }
           const rawParts = Array.isArray(m?.parts) ? m.parts : Array.isArray(m?.content) ? m.content : []
           const parts = rawParts.map((p: any) => {
             if (!p || typeof p !== "object" || p.type === "text" || p.type === "file") return p
@@ -430,6 +484,7 @@ export async function TokenUsageCaptureSetupV2(ctx: any): Promise<void> {
           order++
         }
         s.current = current
+        s.sinceCompact = current
         scheduleWrite()
       } catch {}
     })
