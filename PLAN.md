@@ -2,8 +2,8 @@
 
 ## Project
 - GitHub owner: `aundal`
-- Repository: `opencode-token-monsters`
-- npm package: `@aundal/opencode-token-monsters`
+- Repository: `opencode2-token-monsters` (renamed from `opencode-token-monsters-opencode2` on 2026-10-02)
+- npm package: `@aundal/opencode2-token-monsters`
 - Purpose: OpenCode plugin showing token usage in the TUI sidebar.
 
 ## Current Work

@@ -1,5 +1,5 @@
 {
-  "name": "@aundal/opencode-token-monsters-opencode2",
+  "name": "@aundal/opencode2-token-monsters",
   "version": "0.1.6",
   "description": "OpenCode plugin that shows Token Monsters token usage breakdowns in the TUI sidebar.",
   "author": "aundal",
@@ -26,11 +26,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aundal/opencode-token-monsters.git"
+    "url": "git+https://github.com/aundal/opencode2-token-monsters.git"
   },
-  "homepage": "https://github.com/aundal/opencode-token-monsters#readme",
+  "homepage": "https://github.com/aundal/opencode2-token-monsters#readme",
   "bugs": {
-    "url": "https://github.com/aundal/opencode-token-monsters/issues"
+    "url": "https://github.com/aundal/opencode2-token-monsters/issues"
   },
   "files": [
     "dist",
